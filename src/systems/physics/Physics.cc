@@ -2448,14 +2448,12 @@ void PhysicsPrivate::UpdatePhysics(EntityComponentManager &_ecm)
                  << std::endl;
           return true;
         }
-        // Check if the model is static or ground_plane
+        // Check if the model is ground_plane
         // If so, we refuse to set the pose
-        auto staticComp = _ecm.Component<components::Static>(_entity);
         auto nameComp = _ecm.Component<components::Name>(_entity);
-        if ((staticComp && staticComp->Data()) ||
-            (nameComp && nameComp->Data() == "ground_plane"))
+        if ((nameComp && nameComp->Data() == "ground_plane"))
         {
-          gzerr << "Refusing to set pose for static or ground_plane entity: "
+          gzerr << "Refusing to set pose for ground_plane entity: "
                 << (nameComp ? nameComp->Data() : "") << std::endl;
           return true;
         }
