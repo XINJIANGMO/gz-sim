@@ -42,12 +42,26 @@
 
 #include "../helpers/Relay.hh"
 #include "../helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Subscription.hh"
+#include "../helpers/Util.hh"
 
 #define tol 0.005
 
 using namespace gz;
 using namespace sim;
 using namespace std::chrono_literals;
+
+namespace
+{
+/////////////////////////////////////////////////
+/// \brief Convert a protobuf timestamp to seconds.
+double stampSeconds(const msgs::Time &_stamp)
+{
+  return static_cast<double>(_stamp.sec()) +
+      static_cast<double>(_stamp.nsec()) * 1e-9;
+}
+}  // namespace
 
 /// \brief Test OdometryPublisher system
 class OdometryPublisherTest
@@ -684,6 +698,144 @@ TEST_P(OdometryPublisherTest, GZ_UTILS_TEST_DISABLED_ON_WIN32(Movement))
   TestMovement(
       std::string(PROJECT_SOURCE_PATH) + "/test/worlds/odometry_publisher.sdf",
       "/model/vehicle/odometry");
+}
+
+/////////////////////////////////////////////////
+TEST_P(OdometryPublisherTest,
+       GZ_UTILS_TEST_DISABLED_ON_WIN32(ResetStateContamination))
+{
+  ServerConfig serverConfig;
+  serverConfig.SetSdfFile(std::string(PROJECT_SOURCE_PATH) +
+      "/test/worlds/odometry_publisher.sdf");
+
+  Server server(serverConfig);
+  server.SetUpdatePeriod(0ns);
+
+  test::Relay poseRecorder;
+  std::vector<math::Pose3d> poses;
+  poseRecorder.OnPostUpdate([&poses](const UpdateInfo &,
+      const EntityComponentManager &_ecm)
+    {
+      auto id = _ecm.EntityByComponents(
+          components::Model(), components::Name("vehicle"));
+      ASSERT_NE(kNullEntity, id);
+
+      auto poseComp = _ecm.Component<components::Pose>(id);
+      ASSERT_NE(nullptr, poseComp);
+      poses.push_back(poseComp->Data());
+    });
+  server.AddSystem(poseRecorder.systemPtr);
+
+  bool writeMovingCommand = false;
+  const math::Vector3d linVelCmd(1, 0.5, 0);
+  const math::Vector3d angVelCmd(0, 0, 0.2);
+  test::Relay velocityWriter;
+  velocityWriter.OnPreUpdate(
+      [&writeMovingCommand, linVelCmd, angVelCmd](const UpdateInfo &,
+          EntityComponentManager &_ecm)
+      {
+        auto entity = _ecm.EntityByComponents(
+            components::Model(), components::Name("vehicle"));
+        ASSERT_NE(kNullEntity, entity);
+
+        const auto linCmd =
+            writeMovingCommand ? linVelCmd : math::Vector3d::Zero;
+        const auto angCmd =
+            writeMovingCommand ? angVelCmd : math::Vector3d::Zero;
+
+        auto linVelCmdComp =
+          _ecm.Component<components::LinearVelocityCmd>(entity);
+        if (!linVelCmdComp)
+        {
+          _ecm.CreateComponent(entity,
+              components::LinearVelocityCmd(linCmd));
+        }
+        else
+        {
+          linVelCmdComp->Data() = linCmd;
+        }
+
+        auto angVelCmdComp =
+          _ecm.Component<components::AngularVelocityCmd>(entity);
+        if (!angVelCmdComp)
+        {
+          _ecm.CreateComponent(entity,
+              components::AngularVelocityCmd(angCmd));
+        }
+        else
+        {
+          angVelCmdComp->Data() = angCmd;
+        }
+      });
+  server.AddSystem(velocityWriter.systemPtr);
+
+  transport::Node node;
+  Subscription<msgs::Odometry> odomReceiver;
+  odomReceiver.Subscribe(node, "/model/vehicle/odometry", 1u);
+
+  server.Run(true, 200, false);
+  ASSERT_FALSE(poses.empty());
+  const auto initialPose = poses.front();
+
+  // Move the model first so stale finite-difference or rolling mean state would
+  // be observable after reset.
+  writeMovingCommand = true;
+  server.Run(true, 1500, false);
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s,
+      [&odomReceiver]()
+      {
+        return odomReceiver.Count() >= 10u;
+      }));
+
+  ASSERT_GT(poses.back().Pos().X(), initialPose.Pos().X() + 0.1);
+  const auto preResetOdom = odomReceiver.Last();
+  ASSERT_TRUE(preResetOdom.has_header());
+  ASSERT_TRUE(preResetOdom.header().has_stamp());
+  const double preResetStamp = stampSeconds(preResetOdom.header().stamp());
+  EXPECT_GT(preResetStamp, 0.0);
+
+  // Write zero velocity after reset; any non-zero odometry twist now indicates
+  // reset-time state contamination rather than an active command.
+  writeMovingCommand = false;
+  const auto preResetCount = odomReceiver.Count();
+  gz::sim::test::reset::RequestAndApplyWorldReset(server, "diff_drive");
+
+  const auto postResetPoseBegin = poses.size();
+  server.Run(true, 500, false);
+  ASSERT_GT(poses.size(), postResetPoseBegin);
+
+  // Wait for a post-reset odometry message instead of reading a queued
+  // pre-reset transport message.
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s,
+      [&odomReceiver, preResetCount, preResetStamp]()
+      {
+        if (odomReceiver.Count() <= preResetCount)
+          return false;
+
+        const auto msg = odomReceiver.Last();
+        return msg.has_header() && msg.header().has_stamp() &&
+            stampSeconds(msg.header().stamp()) < preResetStamp;
+      }));
+
+  const auto postResetOdom = odomReceiver.Last();
+  const auto postResetOdomPose = msgs::Convert(postResetOdom.pose());
+  EXPECT_NEAR(postResetOdomPose.Pos().X(), initialPose.Pos().X(), 0.05);
+  EXPECT_NEAR(postResetOdomPose.Pos().Y(), initialPose.Pos().Y(), 0.05);
+  EXPECT_NEAR(postResetOdom.twist().linear().x(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().linear().y(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().angular().z(), 0.0, 0.05);
+
+  const auto postResetStartPose = poses[postResetPoseBegin];
+  const auto postResetEndPose = poses.back();
+  EXPECT_NEAR(postResetStartPose.Pos().X(), initialPose.Pos().X(), 0.02);
+  EXPECT_NEAR(postResetEndPose.Pos().X(), initialPose.Pos().X(), 0.02);
+
+  // Verify publishing continues to work after the reset window.
+  writeMovingCommand = true;
+  const auto newCommandStartPose = poses.back();
+  server.Run(true, 1000, false);
+  ASSERT_FALSE(poses.empty());
+  EXPECT_GT(poses.back().Pos().X(), newCommandStartPose.Pos().X() + 0.05);
 }
 
 /////////////////////////////////////////////////
