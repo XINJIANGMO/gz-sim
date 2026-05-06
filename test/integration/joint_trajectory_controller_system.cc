@@ -28,6 +28,7 @@
 #include <gz/utils/ExtraTestMacros.hh>
 
 #include "gz/sim/components/Joint.hh"
+#include "gz/sim/components/JointForceCmd.hh"
 #include "gz/sim/components/JointPosition.hh"
 #include "gz/sim/components/JointVelocity.hh"
 #include "gz/sim/components/Name.hh"
@@ -38,6 +39,8 @@
 
 #include "../helpers/EnvTestFixture.hh"
 #include "../helpers/Relay.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Util.hh"
 
 #define TOL 1e-4
 
@@ -395,4 +398,117 @@ TEST_F(JointTrajectoryControllerTestFixture,
     // Keep track of how many iterations have already passed
     previousIterFromStart = iterFromStart;
   }
+}
+
+/////////////////////////////////////////////////
+TEST_F(JointTrajectoryControllerTestFixture,
+    GZ_UTILS_TEST_DISABLED_ON_WIN32(ResetStateContamination))
+{
+  using namespace std::chrono_literals;
+
+  const auto sdfFile = std::string(PROJECT_SOURCE_PATH) +
+                       "/test/worlds/joint_trajectory_controller.sdf";
+  const size_t kNumberOfJoints = 2;
+  const std::string jointNames[kNumberOfJoints] = {
+      "RR_position_control_joint1",
+      "RR_position_control_joint2"};
+  const std::string trajectoryTopic =
+      "/model/RR_position_control/joint_trajectory";
+
+  ServerConfig serverConfig;
+  serverConfig.SetSdfFile(sdfFile);
+
+  Server server(serverConfig);
+  EXPECT_FALSE(server.Running());
+  EXPECT_FALSE(*server.Running(0));
+  server.SetUpdatePeriod(0ns);
+
+  std::array<double, kNumberOfJoints> currentPositions{0.0, 0.0};
+  std::array<double, kNumberOfJoints> currentForces{0.0, 0.0};
+  test::Relay testSystem;
+  testSystem.OnPreUpdate(
+      [&](const sim::UpdateInfo &, sim::EntityComponentManager &_ecm)
+      {
+        for (const auto &jointName : jointNames)
+        {
+          const auto joint = _ecm.EntityByComponents(
+              components::Joint(), components::Name(jointName));
+          if (nullptr == _ecm.Component<components::JointPosition>(joint))
+          {
+            _ecm.CreateComponent(joint, components::JointPosition());
+          }
+          if (nullptr == _ecm.Component<components::JointForceCmd>(joint))
+          {
+            _ecm.CreateComponent(joint, components::JointForceCmd({0.0}));
+          }
+        }
+      });
+  testSystem.OnPostUpdate(
+      [&](const sim::UpdateInfo &, const sim::EntityComponentManager &_ecm)
+      {
+        for (std::size_t i = 0; i < kNumberOfJoints; ++i)
+        {
+          const auto joint = _ecm.EntityByComponents(
+              components::Joint(), components::Name(jointNames[i]));
+          const auto jointPosition =
+              _ecm.Component<components::JointPosition>(joint);
+          const auto jointForce =
+              _ecm.Component<components::JointForceCmd>(joint);
+          ASSERT_NE(nullptr, jointPosition);
+          ASSERT_NE(nullptr, jointForce);
+          ASSERT_FALSE(jointPosition->Data().empty());
+          ASSERT_FALSE(jointForce->Data().empty());
+          currentPositions[i] = jointPosition->Data()[0];
+          currentForces[i] = jointForce->Data()[0];
+        }
+      });
+  server.AddSystem(testSystem.systemPtr);
+
+  server.Run(true, 10, false);
+  for (std::size_t i = 0; i < kNumberOfJoints; ++i)
+  {
+    EXPECT_NEAR(0.0, currentPositions[i], TOL);
+    EXPECT_NEAR(0.0, currentForces[i], TOL);
+  }
+
+  gz::msgs::JointTrajectory msg;
+  for (const auto &jointName : jointNames)
+  {
+    msg.add_joint_names(jointName);
+  }
+
+  gz::msgs::JointTrajectoryPoint point;
+  point.mutable_time_from_start()->set_sec(0);
+  point.mutable_time_from_start()->set_nsec(500000000);
+  point.add_positions(-0.7854);
+  point.add_positions(0.7854);
+  msg.add_points()->CopyFrom(point);
+
+  transport::Node node;
+  auto pub = node.Advertise<msgs::JointTrajectory>(trajectoryTopic);
+  EXPECT_TRUE(pub.Publish(msg));
+  std::this_thread::sleep_for(100ms);
+
+  // Move the joints away from their initial state so stale trajectory / PID
+  // state becomes visible after reset.
+  server.Run(true, 500, false);
+  EXPECT_NEAR(-0.7854, currentPositions[0], TOL);
+  EXPECT_NEAR(0.7854, currentPositions[1], TOL);
+
+  gz::sim::test::reset::RequestAndApplyWorldReset(server, "default");
+
+  // After reset, the controller must not keep driving the old trajectory.
+  server.Run(true, 200, false);
+  for (std::size_t i = 0; i < kNumberOfJoints; ++i)
+  {
+    EXPECT_NEAR(0.0, currentPositions[i], 5e-2);
+    EXPECT_NEAR(0.0, currentForces[i], 1e-3);
+  }
+
+  // The controller should still execute a fresh trajectory after reset.
+  EXPECT_TRUE(pub.Publish(msg));
+  std::this_thread::sleep_for(100ms);
+  server.Run(true, 500, false);
+  EXPECT_NEAR(-0.7854, currentPositions[0], TOL);
+  EXPECT_NEAR(0.7854, currentPositions[1], TOL);
 }
