@@ -43,12 +43,26 @@
 
 #include "../helpers/Relay.hh"
 #include "../helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Subscription.hh"
+#include "../helpers/Util.hh"
 
 #define tol 10e-4
 
 using namespace gz;
 using namespace sim;
 using namespace std::chrono_literals;
+
+namespace
+{
+/////////////////////////////////////////////////
+/// \brief Convert a protobuf timestamp to seconds.
+double stampSeconds(const msgs::Time &_stamp)
+{
+  return static_cast<double>(_stamp.sec()) +
+      static_cast<double>(_stamp.nsec()) * 1e-9;
+}
+}  // namespace
 
 /// \brief Test MecanumDrive system
 class MecanumDriveTest : public InternalFixture<::testing::Test>
@@ -270,6 +284,120 @@ TEST_F(MecanumDriveTest,
       std::string(PROJECT_SOURCE_PATH),
       "test", "worlds", "mecanum_drive_custom_topics.sdf"),
       "/model/foo/cmdvel", "/model/bar/odom");
+}
+
+/////////////////////////////////////////////////
+TEST_F(MecanumDriveTest, GZ_UTILS_TEST_DISABLED_ON_WIN32(
+    ResetStateContamination))
+{
+  ServerConfig serverConfig;
+  serverConfig.SetSdfFile(common::joinPaths(std::string(PROJECT_SOURCE_PATH),
+      "test", "worlds", "mecanum_drive.sdf"));
+
+  Server server(serverConfig);
+  server.SetUpdatePeriod(0ns);
+
+  test::Relay poseRecorder;
+  std::vector<math::Pose3d> poses;
+  poseRecorder.OnPostUpdate([&poses](const UpdateInfo &,
+      const EntityComponentManager &_ecm)
+    {
+      auto id = _ecm.EntityByComponents(
+          components::Model(), components::Name("vehicle_blue"));
+      ASSERT_NE(kNullEntity, id);
+
+      auto poseComp = _ecm.Component<components::Pose>(id);
+      ASSERT_NE(nullptr, poseComp);
+      poses.push_back(poseComp->Data());
+    });
+  server.AddSystem(poseRecorder.systemPtr);
+
+  transport::Node node;
+  auto pub = node.Advertise<msgs::Twist>("/model/vehicle_blue/cmd_vel");
+
+  bool publishCmd = false;
+  msgs::Twist cmd;
+  msgs::Set(cmd.mutable_linear(), math::Vector3d(0.5, 0.5, 0));
+  msgs::Set(cmd.mutable_angular(), math::Vector3d(0, 0, 0.1));
+
+  test::Relay cmdPublisher;
+  cmdPublisher.OnPreUpdate(
+      [&publishCmd, &pub, &cmd](const UpdateInfo &,
+          const EntityComponentManager &)
+      {
+        if (publishCmd)
+          pub.Publish(cmd);
+      });
+  server.AddSystem(cmdPublisher.systemPtr);
+
+  Subscription<msgs::Odometry> odomReceiver;
+  odomReceiver.Subscribe(node, "/model/vehicle_blue/odometry", 1u);
+
+  server.Run(true, 200, false);
+  ASSERT_FALSE(poses.empty());
+  const auto initialPose = poses.front();
+
+  // Move the robot first so stale odometry state is visible after reset.
+  publishCmd = true;
+  server.Run(true, 2000, false);
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s,
+      [&odomReceiver]()
+      {
+        return odomReceiver.Count() >= 10u;
+      }));
+
+  ASSERT_GT(poses.back().Pos().Distance(initialPose.Pos()), 0.05);
+  const auto preResetOdom = odomReceiver.Last();
+  ASSERT_TRUE(preResetOdom.has_header());
+  ASSERT_TRUE(preResetOdom.header().has_stamp());
+  const double preResetStamp = stampSeconds(preResetOdom.header().stamp());
+  EXPECT_GT(preResetStamp, 0.0);
+
+  // Stop the old command before reset; any post-reset motion now must be stale
+  // internal state rather than continued input.
+  publishCmd = false;
+  const auto preResetCount = odomReceiver.Count();
+  gz::sim::test::reset::RequestAndApplyWorldReset(server, "mecanum_drive");
+
+  const auto postResetPoseBegin = poses.size();
+  server.Run(true, 500, false);
+  ASSERT_GT(poses.size(), postResetPoseBegin);
+
+  // Wait for an odometry message from the reset episode, not one left in the
+  // transport queue from before reset.
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s,
+      [&odomReceiver, preResetCount, preResetStamp]()
+      {
+        if (odomReceiver.Count() <= preResetCount)
+          return false;
+
+        const auto msg = odomReceiver.Last();
+        return msg.has_header() && msg.header().has_stamp() &&
+            stampSeconds(msg.header().stamp()) < preResetStamp;
+      }));
+
+  const auto postResetOdom = odomReceiver.Last();
+  const auto postResetOdomPose = msgs::Convert(postResetOdom.pose());
+  EXPECT_NEAR(postResetOdomPose.Pos().X(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdomPose.Pos().Y(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdomPose.Rot().Yaw(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().linear().x(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().linear().y(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().angular().z(), 0.0, 0.05);
+
+  const auto postResetStartPose = poses[postResetPoseBegin];
+  const auto postResetEndPose = poses.back();
+  EXPECT_NEAR(postResetStartPose.Pos().X(), initialPose.Pos().X(), 0.05);
+  EXPECT_NEAR(postResetStartPose.Pos().Y(), initialPose.Pos().Y(), 0.05);
+  EXPECT_NEAR(postResetEndPose.Pos().X(), initialPose.Pos().X(), 0.05);
+  EXPECT_NEAR(postResetEndPose.Pos().Y(), initialPose.Pos().Y(), 0.05);
+
+  // Verify the system can still respond to a fresh command after reset.
+  publishCmd = true;
+  const auto newCommandStartPose = poses.back();
+  server.Run(true, 1000, false);
+  ASSERT_FALSE(poses.empty());
+  EXPECT_GT(poses.back().Pos().Distance(newCommandStartPose.Pos()), 0.02);
 }
 
 // /////////////////////////////////////////////////
