@@ -46,17 +46,6 @@ using namespace gz;
 using namespace sim;
 using namespace std::chrono_literals;
 
-namespace
-{
-/////////////////////////////////////////////////
-/// \brief Convert a protobuf timestamp to seconds.
-double stampSeconds(const msgs::Time &_stamp)
-{
-  return static_cast<double>(_stamp.sec()) +
-      static_cast<double>(_stamp.nsec()) * 1e-9;
-}
-}  // namespace
-
 /// \brief Test DiffDrive system
 class DiffDriveTest : public InternalFixture<::testing::TestWithParam<int>>
 {
@@ -314,7 +303,8 @@ TEST_P(DiffDriveTest,
   const auto preResetOdom = odomReceiver.Last();
   ASSERT_TRUE(preResetOdom.has_header());
   ASSERT_TRUE(preResetOdom.header().has_stamp());
-  const double preResetStamp = stampSeconds(preResetOdom.header().stamp());
+  const double preResetStamp =
+      gz::sim::test::StampSeconds(preResetOdom.header().stamp());
   EXPECT_GT(preResetStamp, 0.0);
 
   // Stop sending the old command before reset so post-reset motion must come
@@ -337,7 +327,7 @@ TEST_P(DiffDriveTest,
 
         const auto msg = odomReceiver.Last();
         return msg.has_header() && msg.header().has_stamp() &&
-            stampSeconds(msg.header().stamp()) < preResetStamp;
+            gz::sim::test::StampSeconds(msg.header().stamp()) < preResetStamp;
       }));
 
   const auto postResetOdom = odomReceiver.Last();
