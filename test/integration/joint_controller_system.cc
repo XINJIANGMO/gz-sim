@@ -36,6 +36,8 @@
 
 #include "../helpers/Relay.hh"
 #include "../helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Util.hh"
 
 #define TOL 1e-4
 
@@ -177,6 +179,97 @@ TEST_F(JointControllerTestFixture,
   msg.set_data(testAngVel);
 
   pub.Publish(msg);
+}
+
+/////////////////////////////////////////////////
+TEST_F(JointControllerTestFixture,
+       GZ_UTILS_TEST_DISABLED_ON_WIN32(ResetStateContamination))
+{
+  using namespace std::chrono_literals;
+
+  ServerConfig serverConfig;
+  serverConfig.SetSdfFile(common::joinPaths(
+      PROJECT_SOURCE_PATH, "test", "worlds", "joint_controller.sdf"));
+
+  Server server(serverConfig);
+  server.SetUpdatePeriod(0ns);
+
+  const std::string linkName = "rotor3";
+
+  test::Relay testSystem;
+  std::vector<math::Vector3d> angularVelocities;
+  testSystem.OnPreUpdate(
+      [&](const UpdateInfo &, EntityComponentManager &_ecm)
+      {
+        auto link = _ecm.EntityByComponents(
+            components::Link(), components::Name(linkName));
+        if (nullptr == _ecm.Component<components::AngularVelocity>(link))
+        {
+          _ecm.CreateComponent(link, components::AngularVelocity());
+        }
+      });
+
+  testSystem.OnPostUpdate([&](const UpdateInfo &,
+                              const EntityComponentManager &_ecm)
+      {
+        _ecm.Each<components::Link, components::Name,
+                  components::AngularVelocity>(
+            [&](const Entity &,
+                const components::Link *,
+                const components::Name *_name,
+                const components::AngularVelocity *_angularVel) -> bool
+            {
+              if (_name->Data() == linkName)
+                angularVelocities.push_back(_angularVel->Data());
+              return true;
+            });
+      });
+  server.AddSystem(testSystem.systemPtr);
+
+  transport::Node node;
+  auto pub = node.Advertise<msgs::Double>(
+      "/model/joint_controller_test_2/joint/j1/cmd_vel");
+  ASSERT_TRUE(gz::sim::test::WaitUntil(2s, [&pub]
+      {
+        return pub.HasConnections();
+      }));
+
+  server.Run(true, 100, false);
+  ASSERT_FALSE(angularVelocities.empty());
+  EXPECT_NEAR(0.0, angularVelocities.back().Length(), 0.05);
+
+  // Drive the joint first so any retained target remains observable after
+  // reset.
+  msgs::Double msg;
+  msg.set_data(10.0);
+  pub.Publish(msg);
+  std::this_thread::sleep_for(100ms);
+
+  angularVelocities.clear();
+  server.Run(true, 1000, false);
+  ASSERT_FALSE(angularVelocities.empty());
+  EXPECT_GT(std::abs(angularVelocities.back().Z()), 1.0);
+
+  // No command is re-sent after reset, so renewed motion would indicate stale
+  // controller state.
+  gz::sim::test::reset::RequestAndApplyWorldReset(server, "default");
+  angularVelocities.clear();
+  server.Run(true, 500, false);
+  ASSERT_FALSE(angularVelocities.empty());
+  for (const auto &angularVel : angularVelocities)
+  {
+    EXPECT_NEAR(0.0, angularVel.Length(), 0.1);
+  }
+
+  // Fresh commands should still work after reset.
+  msg.set_data(6.0);
+  pub.Publish(msg);
+  std::this_thread::sleep_for(100ms);
+
+  angularVelocities.clear();
+  server.Run(true, 1000, false);
+  ASSERT_FALSE(angularVelocities.empty());
+  EXPECT_GT(std::abs(angularVelocities.back().Z()), 1.0);
 }
 
 /////////////////////////////////////////////////

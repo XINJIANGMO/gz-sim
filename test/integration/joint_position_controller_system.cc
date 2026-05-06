@@ -39,6 +39,8 @@
 
 #include "../helpers/Relay.hh"
 #include "../helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Util.hh"
 
 #define TOL 1e-4
 
@@ -289,6 +291,94 @@ TEST_F(JointPositionControllerTestFixture,
   server.Run(true, testIters, false);
 
   EXPECT_NEAR(targetPosition, currentPosition.at(0), TOL);
+}
+
+/////////////////////////////////////////////////
+TEST_F(JointPositionControllerTestFixture,
+       GZ_UTILS_TEST_DISABLED_ON_WIN32(ResetStateContamination))
+{
+  using namespace std::chrono_literals;
+
+  ServerConfig serverConfig;
+  serverConfig.SetSdfFile(common::joinPaths(
+      PROJECT_SOURCE_PATH, "test", "worlds",
+      "joint_position_controller.sdf"));
+
+  Server server(serverConfig);
+  server.SetUpdatePeriod(0ns);
+
+  const std::string jointName = "j1";
+
+  test::Relay testSystem;
+  std::vector<double> currentPosition;
+  testSystem.OnPreUpdate(
+      [&](const UpdateInfo &, EntityComponentManager &_ecm)
+      {
+        auto joint = _ecm.EntityByComponents(components::Joint(),
+                                             components::Name(jointName));
+        if (nullptr == _ecm.Component<components::JointPosition>(joint))
+        {
+          _ecm.CreateComponent(joint, components::JointPosition());
+        }
+      });
+
+  testSystem.OnPostUpdate([&](const UpdateInfo &,
+                              const EntityComponentManager &_ecm)
+      {
+        _ecm.Each<components::Joint, components::Name,
+                  components::JointPosition>(
+            [&](const Entity &,
+                const components::Joint *,
+                const components::Name *_name,
+                const components::JointPosition *_position) -> bool
+            {
+              if (_name->Data() == jointName)
+                currentPosition = _position->Data();
+              return true;
+            });
+      });
+  server.AddSystem(testSystem.systemPtr);
+
+  transport::Node node;
+  auto pub = node.Advertise<msgs::Double>(
+      "/model/joint_position_controller_test/joint/j1/0/cmd_pos");
+  ASSERT_TRUE(gz::sim::test::WaitUntil(2s, [&pub]
+      {
+        return pub.HasConnections();
+      }));
+
+  server.Run(true, 50, false);
+  ASSERT_FALSE(currentPosition.empty());
+  EXPECT_NEAR(0.0, currentPosition.at(0), TOL);
+
+  // Move away from the initial position so a retained target becomes visible.
+  msgs::Double msg;
+  msg.set_data(2.0);
+  pub.Publish(msg);
+  std::this_thread::sleep_for(100ms);
+
+  server.Run(true, 1000, false);
+  ASSERT_FALSE(currentPosition.empty());
+  EXPECT_NEAR(2.0, currentPosition.at(0), TOL);
+
+  // No old target is re-sent after reset.
+  gz::sim::test::reset::RequestAndApplyWorldReset(server, "default");
+  server.Run(true, 500, false);
+  ASSERT_FALSE(currentPosition.empty());
+  EXPECT_NEAR(0.0, currentPosition.at(0), 0.05);
+
+  server.Run(true, 500, false);
+  ASSERT_FALSE(currentPosition.empty());
+  EXPECT_NEAR(0.0, currentPosition.at(0), 0.05);
+
+  // Fresh position commands should still work after reset.
+  msg.set_data(-1.0);
+  pub.Publish(msg);
+  std::this_thread::sleep_for(100ms);
+
+  server.Run(true, 1000, false);
+  ASSERT_FALSE(currentPosition.empty());
+  EXPECT_NEAR(-1.0, currentPosition.at(0), 0.05);
 }
 
 
