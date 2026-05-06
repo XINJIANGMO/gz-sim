@@ -36,6 +36,9 @@
 
 #include "../helpers/Relay.hh"
 #include "../helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Subscription.hh"
+#include "../helpers/Util.hh"
 
 #define tol 10e-4
 
@@ -234,6 +237,117 @@ TEST_P(DiffDriveTest,
       std::string(PROJECT_SOURCE_PATH) +
       "/test/worlds/diff_drive_custom_topics.sdf",
       "/model/foo/cmdvel", "/model/bar/odom");
+}
+
+/////////////////////////////////////////////////
+TEST_P(DiffDriveTest,
+       GZ_UTILS_TEST_DISABLED_ON_WIN32(ResetStateContamination))
+{
+  ServerConfig serverConfig;
+  serverConfig.SetSdfFile(std::string(PROJECT_SOURCE_PATH) +
+      "/test/worlds/diff_drive.sdf");
+
+  Server server(serverConfig);
+  server.SetUpdatePeriod(0ns);
+
+  test::Relay poseRecorder;
+  std::vector<math::Pose3d> poses;
+  poseRecorder.OnPostUpdate([&poses](const UpdateInfo &,
+      const EntityComponentManager &_ecm)
+    {
+      auto id = _ecm.EntityByComponents(
+          components::Model(), components::Name("vehicle"));
+      ASSERT_NE(kNullEntity, id);
+
+      auto poseComp = _ecm.Component<components::Pose>(id);
+      ASSERT_NE(nullptr, poseComp);
+      poses.push_back(poseComp->Data());
+    });
+  server.AddSystem(poseRecorder.systemPtr);
+
+  transport::Node node;
+  auto pub = node.Advertise<msgs::Twist>("/model/vehicle/cmd_vel");
+
+  bool publishCmd = false;
+  msgs::Twist cmd;
+  msgs::Set(cmd.mutable_linear(), math::Vector3d(0.5, 0, 0));
+  msgs::Set(cmd.mutable_angular(), math::Vector3d(0, 0, 0));
+
+  test::Relay cmdPublisher;
+  cmdPublisher.OnPreUpdate(
+      [&publishCmd, &pub, &cmd](const UpdateInfo &,
+          const EntityComponentManager &)
+      {
+        if (publishCmd)
+          pub.Publish(cmd);
+      });
+  server.AddSystem(cmdPublisher.systemPtr);
+
+  Subscription<msgs::Odometry> odomReceiver;
+  odomReceiver.Subscribe(node, "/model/vehicle/odometry", 1u);
+
+  server.Run(true, 200, false);
+  ASSERT_FALSE(poses.empty());
+  const auto initialPose = poses.front();
+
+  // Move the robot far enough to make any pre-reset odometry state visible.
+  publishCmd = true;
+  server.Run(true, 1500, false);
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s,
+      [&odomReceiver]()
+      {
+        return odomReceiver.Count() >= 10u;
+      }));
+
+  ASSERT_GT(poses.back().Pos().X(), initialPose.Pos().X() + 0.1);
+  const auto preResetOdom = odomReceiver.Last();
+  ASSERT_TRUE(preResetOdom.has_header());
+  ASSERT_TRUE(preResetOdom.header().has_stamp());
+  const double preResetStamp =
+      gz::sim::test::StampSeconds(preResetOdom.header().stamp());
+  EXPECT_GT(preResetStamp, 0.0);
+
+  // Stop sending the old command before reset so post-reset motion must come
+  // from stale internal state if any remains.
+  publishCmd = false;
+  const auto preResetCount = odomReceiver.Count();
+  gz::sim::test::reset::RequestAndApplyWorldReset(server, "diff_drive");
+
+  const auto postResetPoseBegin = poses.size();
+  server.Run(true, 500, false);
+  ASSERT_GT(poses.size(), postResetPoseBegin);
+
+  // Ignore transport messages from before reset by waiting for the odometry
+  // timestamp to rewind with simulation time.
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s,
+      [&odomReceiver, preResetCount, preResetStamp]()
+      {
+        if (odomReceiver.Count() <= preResetCount)
+          return false;
+
+        const auto msg = odomReceiver.Last();
+        return msg.has_header() && msg.header().has_stamp() &&
+            gz::sim::test::StampSeconds(msg.header().stamp()) < preResetStamp;
+      }));
+
+  const auto postResetOdom = odomReceiver.Last();
+  const auto postResetOdomPose = msgs::Convert(postResetOdom.pose());
+  EXPECT_NEAR(postResetOdomPose.Pos().X(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdomPose.Pos().Y(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().linear().x(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().angular().z(), 0.0, 0.05);
+
+  const auto postResetStartPose = poses[postResetPoseBegin];
+  const auto postResetEndPose = poses.back();
+  EXPECT_NEAR(postResetStartPose.Pos().X(), initialPose.Pos().X(), 0.02);
+  EXPECT_NEAR(postResetEndPose.Pos().X(), initialPose.Pos().X(), 0.02);
+
+  // The system should still accept fresh commands after reset.
+  publishCmd = true;
+  const auto newCommandStartPose = poses.back();
+  server.Run(true, 1000, false);
+  ASSERT_FALSE(poses.empty());
+  EXPECT_GT(poses.back().Pos().X(), newCommandStartPose.Pos().X() + 0.05);
 }
 
 /////////////////////////////////////////////////

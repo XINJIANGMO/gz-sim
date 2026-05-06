@@ -42,6 +42,9 @@
 #include "helpers/Relay.hh"
 #include "helpers/UniqueTestDirectoryEnv.hh"
 #include "helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Subscription.hh"
+#include "../helpers/Util.hh"
 
 using namespace gz;
 using namespace sim;
@@ -663,6 +666,41 @@ TEST_F(BreadcrumbsTest, GZ_UTILS_TEST_DISABLED_ON_WIN32(LevelLoadUnload))
 
   this->server->AddSystem(testSystem.systemPtr);
   this->server->Run(true, nIters, false);
+}
+
+/////////////////////////////////////////////////
+TEST_F(BreadcrumbsTest, GZ_UTILS_TEST_DISABLED_ON_WIN32(ResetRestoresDeployments))
+{
+  this->LoadWorld(common::joinPaths("test", "worlds", "breadcrumbs.sdf"));
+
+  transport::Node node;
+  auto deployB1 =
+      node.Advertise<msgs::Empty>("/model/vehicle_blue/breadcrumbs/B1/deploy");
+  Subscription<msgs::Int32> remainingSub;
+  remainingSub.Subscribe(
+      node, "/model/vehicle_blue/breadcrumbs/B1/deploy/remaining", 4u);
+
+  this->server->Run(true, 1, false);
+
+  // Consume one deployment so the remaining count leaves its initial state.
+  EXPECT_TRUE(deployB1.Publish(msgs::Empty()));
+  EXPECT_TRUE(test::StepUntil(*this->server, 200u, [&]
+      {
+        return remainingSub.Count() > 0u && remainingSub.Last().data() == 2;
+      }));
+
+  gz::sim::test::reset::RequestAndApplyWorldReset(*this->server, "breadcrumbs");
+  this->server->Run(true, 10, false);
+
+  const auto countBeforeSecondDeploy = remainingSub.Count();
+
+  // The first deploy after reset should behave like the first deploy overall.
+  EXPECT_TRUE(deployB1.Publish(msgs::Empty()));
+  EXPECT_TRUE(test::StepUntil(*this->server, 200u, [&]
+      {
+        return remainingSub.Count() > countBeforeSecondDeploy &&
+               remainingSub.Last().data() == 2;
+      }));
 }
 
 /////////////////////////////////////////////////

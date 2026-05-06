@@ -45,6 +45,9 @@
 
 #include "plugins/MockSystem.hh"
 #include "../helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Subscription.hh"
+#include "../helpers/Util.hh"
 
 using namespace gz;
 using namespace sim;
@@ -922,4 +925,54 @@ TEST_F(TriggeredPublisherTest,
 
   waitUntil(5000, [&]{return pubCount == recvCount;});
   EXPECT_EQ(recvCount, recvCount);
+}
+
+/////////////////////////////////////////////////
+TEST_F(TriggeredPublisherTest,
+       GZ_UTILS_TEST_DISABLED_ON_WIN32(ResetClearsDelayedQueue))
+{
+  transport::Node node;
+  Subscription<msgs::Empty> outputSub;
+  outputSub.Subscribe(node, "/out_13", 10u);
+  auto inputPub = node.Advertise<msgs::Empty>("/in_13");
+  GZ_SLEEP_MS(100ms);
+  EXPECT_TRUE(test::WaitUntil(2s, [&]
+      {
+        return inputPub.HasConnections();
+      }));
+
+  EXPECT_TRUE(inputPub.Publish(msgs::Empty()));
+  GZ_SLEEP_MS(100ms);
+
+  // Queue one delayed publication but reset before the delay elapses.
+  this->server->Run(true, 500, false);
+  EXPECT_EQ(0u, outputSub.Count());
+
+  gz::sim::test::reset::RequestAndApplyWorldReset(
+      *this->server, "triggered_publisher");
+
+  const auto preResetCount = outputSub.Count();
+
+  // Keep the same transport endpoints and audit reset behavior through the
+  // message count delta observed on the same topic pair.
+  EXPECT_TRUE(test::WaitUntil(2s, [&]
+      {
+        return inputPub.HasConnections();
+      }));
+
+  this->server->Run(true, 1500, false);
+  EXPECT_EQ(preResetCount, outputSub.Count());
+
+  // A fresh input after reset should still produce exactly one delayed output.
+  EXPECT_TRUE(inputPub.Publish(msgs::Empty()));
+  GZ_SLEEP_MS(100ms);
+  this->server->Run(true, 999, false);
+  EXPECT_EQ(preResetCount, outputSub.Count());
+
+  this->server->Run(true, 1, false);
+  EXPECT_TRUE(test::WaitUntil(5s, [&]
+      {
+        return outputSub.Count() == preResetCount + 1u;
+      }));
+  EXPECT_EQ(preResetCount + 1u, outputSub.Count());
 }

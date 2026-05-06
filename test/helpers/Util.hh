@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include <gz/msgs/time.pb.h>
 #include <gz/sim/Server.hh>
 #include <gz/transport/Node.hh>
 
@@ -85,6 +86,16 @@ bool WaitUntil(
   }
 
   return _predicate();
+}
+
+/////////////////////////////////////////////////
+/// \brief Convert a protobuf timestamp to seconds.
+/// \param[in] _stamp Timestamp message.
+/// \return Timestamp in seconds.
+inline double StampSeconds(const msgs::Time &_stamp)
+{
+  return static_cast<double>(_stamp.sec()) +
+      static_cast<double>(_stamp.nsec()) * 1e-9;
 }
 
 /// \brief Wait until a service becomes available.

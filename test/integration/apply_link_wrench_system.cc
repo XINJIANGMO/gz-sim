@@ -36,6 +36,8 @@
 #include "test_config.hh"
 
 #include "../helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Util.hh"
 
 #define tol 10e-4
 
@@ -346,4 +348,117 @@ TEST_F(ApplyLinkWrenchTestFixture,
   fixture.Server()->Run(true, targetIterations, false);
   EXPECT_EQ(targetIterations, iterations);
   EXPECT_EQ(1u, impulseIterations);
+}
+
+/////////////////////////////////////////////////
+TEST_F(ApplyLinkWrenchTestFixture,
+    GZ_UTILS_TEST_DISABLED_ON_WIN32(ResetStateContamination))
+{
+  TestFixture fixture(common::joinPaths(std::string(PROJECT_SOURCE_PATH),
+    "test", "worlds", "apply_link_wrench.sdf"));
+
+  Link link1, link3;
+  std::optional<double> model1AccelX;
+  std::optional<double> model3AccelX;
+  auto refreshLinks = [&](EntityComponentManager &_ecm)
+  {
+    Model model1(_ecm.EntityByComponents(components::Model(),
+        components::Name("model1")));
+    EXPECT_TRUE(model1.Valid(_ecm));
+    link1 = Link(model1.CanonicalLink(_ecm));
+    EXPECT_TRUE(link1.Valid(_ecm));
+    link1.EnableAccelerationChecks(_ecm);
+
+    Model model3(_ecm.EntityByComponents(components::Model(),
+        components::Name("model3")));
+    EXPECT_TRUE(model3.Valid(_ecm));
+    link3 = Link(model3.CanonicalLink(_ecm));
+    EXPECT_TRUE(link3.Valid(_ecm));
+    link3.EnableAccelerationChecks(_ecm);
+  };
+  fixture.OnConfigure([&](
+      const Entity &,
+      const std::shared_ptr<const sdf::Element> &,
+      EntityComponentManager &_ecm,
+      EventManager &)
+      {
+        refreshLinks(_ecm);
+      })
+  .OnPreUpdate([&](
+      const UpdateInfo &,
+      EntityComponentManager &_ecm)
+      {
+        refreshLinks(_ecm);
+      })
+  .OnPostUpdate([&](
+      const UpdateInfo &,
+      const EntityComponentManager &_ecm)
+      {
+        const auto linAccel1 = link1.WorldLinearAcceleration(_ecm);
+        if (linAccel1.has_value())
+        {
+          model1AccelX = linAccel1->X();
+        }
+
+        const auto linAccel3 = link3.WorldLinearAcceleration(_ecm);
+        if (linAccel3.has_value())
+        {
+          model3AccelX = linAccel3->X();
+        }
+      }).Finalize();
+
+  transport::Node node;
+  auto pubPersistent = node.Advertise<msgs::EntityWrench>(
+      "/world/apply_link_wrench/wrench/persistent");
+
+  int sleep{0};
+  constexpr int maxSleep{30};
+  for (; !pubPersistent.HasConnections() && sleep < maxSleep; ++sleep)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  ASSERT_NE(maxSleep, sleep);
+  ASSERT_TRUE(pubPersistent.HasConnections());
+
+  fixture.Server()->Run(true, 20, false);
+  ASSERT_TRUE(model1AccelX.has_value());
+  ASSERT_TRUE(model3AccelX.has_value());
+  EXPECT_NEAR(50.0, *model1AccelX, tol);
+  EXPECT_NEAR(0.0, *model3AccelX, tol);
+
+  // Apply a runtime persistent wrench that should not survive reset.
+  msgs::EntityWrench msg;
+  msg.mutable_entity()->set_name("model3");
+  msg.mutable_entity()->set_type(msgs::Entity::MODEL);
+  msg.mutable_wrench()->mutable_force()->set_x(80);
+  msg.mutable_wrench()->mutable_torque()->set_z(0.8);
+  EXPECT_TRUE(pubPersistent.Publish(msg));
+
+  EXPECT_TRUE(test::StepUntil(*fixture.Server(), 200u, [&]
+      {
+        return model3AccelX.has_value() &&
+               std::abs(*model3AccelX - 80.0) < tol;
+      }));
+
+  gz::sim::test::reset::RequestAndApplyWorldReset(
+      *fixture.Server(), "apply_link_wrench");
+
+  // The SDF-configured persistent wrench should remain, but the runtime one
+  // must be gone after reset.
+  EXPECT_TRUE(test::StepUntil(*fixture.Server(), 200u, [&]
+      {
+        return model1AccelX.has_value() && model3AccelX.has_value() &&
+               std::abs(*model1AccelX - 50.0) < tol &&
+               std::abs(*model3AccelX) < tol;
+      }));
+
+  // A fresh runtime wrench should still work after reset.
+  msg.mutable_wrench()->mutable_force()->set_x(40);
+  msg.mutable_wrench()->mutable_torque()->set_z(0.4);
+  EXPECT_TRUE(pubPersistent.Publish(msg));
+  EXPECT_TRUE(test::StepUntil(*fixture.Server(), 200u, [&]
+      {
+        return model3AccelX.has_value() &&
+               std::abs(*model3AccelX - 40.0) < tol;
+      }));
 }

@@ -47,6 +47,9 @@
 
 #include "../helpers/Relay.hh"
 #include "../helpers/EnvTestFixture.hh"
+#include "../helpers/ResetUtils.hh"
+#include "../helpers/Subscription.hh"
+#include "../helpers/Util.hh"
 
 #define tol 10e-4
 
@@ -704,4 +707,236 @@ TEST_F(TrackedVehicleTest, GZ_UTILS_TEST_DISABLED_ON_WIN32(Conveyor))
     "/test/worlds/conveyor.sdf",
     "/model/conveyor/link/base_link/track_cmd_vel",
     "/model/conveyor/link/base_link/odometry");
+}
+
+/////////////////////////////////////////////////
+TEST_F(TrackedVehicleTest,
+       GZ_UTILS_TEST_DISABLED_ON_WIN32(TrackControllerResetStateContamination))
+{
+  ServerConfig serverConfig;
+  serverConfig.SetSdfFile(std::string(PROJECT_SOURCE_PATH) +
+      "/test/worlds/conveyor.sdf");
+
+  Server server(serverConfig);
+  server.SetUpdatePeriod(0ns);
+
+  test::Relay ecmGetterSystem;
+  EntityComponentManager *ecm{nullptr};
+  ecmGetterSystem.OnPreUpdate([&ecm](const UpdateInfo &,
+      EntityComponentManager &_ecm)
+    {
+      if (ecm == nullptr)
+        ecm = &_ecm;
+    });
+  server.AddSystem(ecmGetterSystem.systemPtr);
+  server.Run(true, 1, false);
+
+  ASSERT_NE(nullptr, ecm);
+  bool shouldSkipTest = false;
+  this->SkipTestIfNotSupported(*ecm, shouldSkipTest);
+  if (shouldSkipTest)
+  {
+    GTEST_SKIP() << "Skipping test because physics engine does not support "
+      "SetContactPropertiesCallbackFeature";
+  }
+
+  transport::Node node;
+  Subscription<msgs::Odometry> odomReceiver;
+  odomReceiver.Subscribe(
+      node, "/model/conveyor/link/base_link/odometry", 1u);
+  auto pub = node.Advertise<msgs::Double>(
+      "/model/conveyor/link/base_link/track_cmd_vel");
+  ASSERT_TRUE(gz::sim::test::WaitUntil(2s, [&pub]
+      {
+        return pub.HasConnections();
+      }));
+
+  bool publishCmd = false;
+  msgs::Double cmd;
+  cmd.set_data(1.0);
+  test::Relay cmdPublisher;
+  cmdPublisher.OnPreUpdate(
+      [&publishCmd, &pub, &cmd](const UpdateInfo &,
+          const EntityComponentManager &)
+      {
+        if (publishCmd)
+          pub.Publish(cmd);
+      });
+  server.AddSystem(cmdPublisher.systemPtr);
+
+  server.Run(true, 200, false);
+
+  // Build up non-zero odometry first so stale runtime state becomes visible.
+  publishCmd = true;
+  server.Run(true, 1500, false);
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s, [&odomReceiver]
+      {
+        return odomReceiver.Count() >= 10u;
+      }));
+
+  const auto preResetOdom = odomReceiver.Last();
+  ASSERT_TRUE(preResetOdom.has_header());
+  ASSERT_TRUE(preResetOdom.header().has_stamp());
+  EXPECT_GT(preResetOdom.pose().position().x(), 0.05);
+  const auto preResetCount = odomReceiver.Count();
+  const double preResetStamp =
+      gz::sim::test::StampSeconds(preResetOdom.header().stamp());
+
+  publishCmd = false;
+  gz::sim::test::reset::RequestAndApplyWorldReset(server, "default");
+  server.Run(true, 500, false);
+
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s,
+      [&odomReceiver, preResetCount, preResetStamp]()
+      {
+        if (odomReceiver.Count() <= preResetCount)
+          return false;
+
+        const auto msg = odomReceiver.Last();
+        return msg.has_header() && msg.header().has_stamp() &&
+            gz::sim::test::StampSeconds(msg.header().stamp()) < preResetStamp;
+      }));
+
+  const auto postResetOdom = odomReceiver.Last();
+  EXPECT_NEAR(postResetOdom.pose().position().x(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().linear().x(), 0.0, 0.05);
+
+  server.Run(true, 500, false);
+  const auto settledOdom = odomReceiver.Last();
+  EXPECT_NEAR(settledOdom.pose().position().x(), 0.0, 0.05);
+  EXPECT_NEAR(settledOdom.twist().linear().x(), 0.0, 0.05);
+
+  // Fresh commands should still move the tracked surface after reset.
+  publishCmd = true;
+  server.Run(true, 1000, false);
+  const auto freshCommandOdom = odomReceiver.Last();
+  EXPECT_GT(freshCommandOdom.pose().position().x(), 0.05);
+  EXPECT_GT(freshCommandOdom.twist().linear().x(), 0.05);
+}
+
+/////////////////////////////////////////////////
+TEST_F(TrackedVehicleTest,
+       GZ_UTILS_TEST_DISABLED_ON_WIN32(TrackedVehicleResetStateContamination))
+{
+  ServerConfig serverConfig;
+  serverConfig.SetSdfFile(std::string(PROJECT_SOURCE_PATH) +
+      "/test/worlds/tracked_vehicle_simple.sdf");
+
+  Server server(serverConfig);
+  server.SetUpdatePeriod(0ns);
+
+  test::Relay ecmGetterSystem;
+  EntityComponentManager *ecm{nullptr};
+  ecmGetterSystem.OnPreUpdate([&ecm](const UpdateInfo &,
+      EntityComponentManager &_ecm)
+    {
+      if (ecm == nullptr)
+        ecm = &_ecm;
+    });
+  server.AddSystem(ecmGetterSystem.systemPtr);
+  server.Run(true, 1, false);
+
+  ASSERT_NE(nullptr, ecm);
+  bool shouldSkipTest = false;
+  this->SkipTestIfNotSupported(*ecm, shouldSkipTest);
+  if (shouldSkipTest)
+  {
+    GTEST_SKIP() << "Skipping test because physics engine does not support "
+      "SetContactPropertiesCallbackFeature";
+  }
+
+  test::Relay poseRecorder;
+  std::vector<math::Pose3d> poses;
+  poseRecorder.OnPostUpdate([&poses](const UpdateInfo &,
+      const EntityComponentManager &_ecm)
+    {
+      auto id = _ecm.EntityByComponents(
+          components::Model(), components::Name("simple_tracked"));
+      ASSERT_NE(kNullEntity, id);
+
+      auto poseComp = _ecm.Component<components::Pose>(id);
+      ASSERT_NE(nullptr, poseComp);
+      poses.push_back(poseComp->Data());
+    });
+  server.AddSystem(poseRecorder.systemPtr);
+
+  transport::Node node;
+  Subscription<msgs::Odometry> odomReceiver;
+  odomReceiver.Subscribe(node, "/model/simple_tracked/odometry", 1u);
+  auto pub = node.Advertise<msgs::Twist>("/model/simple_tracked/cmd_vel");
+  ASSERT_TRUE(gz::sim::test::WaitUntil(2s, [&pub]
+      {
+        return pub.HasConnections();
+      }));
+
+  bool publishCmd = false;
+  msgs::Twist cmd;
+  msgs::Set(cmd.mutable_linear(), math::Vector3d(0.5, 0, 0));
+  msgs::Set(cmd.mutable_angular(), math::Vector3d(0, 0, 0));
+  test::Relay cmdPublisher;
+  cmdPublisher.OnPreUpdate(
+      [&publishCmd, &pub, &cmd](const UpdateInfo &,
+          const EntityComponentManager &)
+      {
+        if (publishCmd)
+          pub.Publish(cmd);
+      });
+  server.AddSystem(cmdPublisher.systemPtr);
+
+  server.Run(true, 200, false);
+  ASSERT_FALSE(poses.empty());
+  const auto initialPose = poses.front();
+
+  // Move first so any retained target or odometry state is easy to detect.
+  publishCmd = true;
+  server.Run(true, 1500, false);
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s, [&odomReceiver]
+      {
+        return odomReceiver.Count() >= 10u;
+      }));
+
+  ASSERT_GT(poses.back().Pos().X(), initialPose.Pos().X() + 0.05);
+  const auto preResetOdom = odomReceiver.Last();
+  ASSERT_TRUE(preResetOdom.has_header());
+  ASSERT_TRUE(preResetOdom.header().has_stamp());
+  const auto preResetCount = odomReceiver.Count();
+  const double preResetStamp =
+      gz::sim::test::StampSeconds(preResetOdom.header().stamp());
+
+  publishCmd = false;
+  gz::sim::test::reset::RequestAndApplyWorldReset(server, "default");
+
+  const auto postResetPoseBegin = poses.size();
+  server.Run(true, 500, false);
+  ASSERT_GT(poses.size(), postResetPoseBegin);
+
+  ASSERT_TRUE(gz::sim::test::WaitUntil(5s,
+      [&odomReceiver, preResetCount, preResetStamp]()
+      {
+        if (odomReceiver.Count() <= preResetCount)
+          return false;
+
+        const auto msg = odomReceiver.Last();
+        return msg.has_header() && msg.header().has_stamp() &&
+            gz::sim::test::StampSeconds(msg.header().stamp()) < preResetStamp;
+      }));
+
+  const auto postResetOdom = odomReceiver.Last();
+  const auto postResetPose = msgs::Convert(postResetOdom.pose());
+  EXPECT_NEAR(postResetPose.Pos().X(), 0.0, 0.05);
+  EXPECT_NEAR(postResetPose.Pos().Y(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().linear().x(), 0.0, 0.05);
+  EXPECT_NEAR(postResetOdom.twist().angular().z(), 0.0, 0.05);
+
+  const auto postResetStartPose = poses[postResetPoseBegin];
+  const auto postResetEndPose = poses.back();
+  EXPECT_NEAR(postResetStartPose.Pos().X(), initialPose.Pos().X(), 0.05);
+  EXPECT_NEAR(postResetEndPose.Pos().X(), initialPose.Pos().X(), 0.05);
+
+  // Fresh commands should still move the robot after reset.
+  publishCmd = true;
+  const auto newCommandStartPose = poses.back();
+  server.Run(true, 1000, false);
+  ASSERT_FALSE(poses.empty());
+  EXPECT_GT(poses.back().Pos().X(), newCommandStartPose.Pos().X() + 0.02);
 }
