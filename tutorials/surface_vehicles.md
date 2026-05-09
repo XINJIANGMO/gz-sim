@@ -230,11 +230,14 @@ Uncomment the following block from
 hydrodynamics.
 
 ```xml
-<!-- Hydrodynamics (damping only) -->
+<!-- Hydrodynamics -->
 <plugin
   filename="gz-sim-hydrodynamics-system"
   name="gz::sim::systems::Hydrodynamics">
   <link_name>base_link</link_name>
+  <xDotU>0.0</xDotU>
+  <yDotV>0.0</yDotV>
+  <nDotR>0.0</nDotR>
   <xU>-51.3</xU>
   <xAbsU>-72.4</xAbsU>
   <yV>-40.0</yV>
